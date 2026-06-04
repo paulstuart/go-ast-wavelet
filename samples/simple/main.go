@@ -2,6 +2,21 @@ package main
 
 import "fmt"
 
+func main() {
+	SimpleFunction()
+
+	items := []int{1, 42, 7}
+	GnarlyFunction(items)
+
+	w := &Worker{
+		jobs: make(chan int, 10),
+		done: make(chan struct{}),
+	}
+	go w.Run()
+	w.jobs <- 1
+	close(w.jobs)
+}
+
 func SimpleFunction() {
 	fmt.Println("I am quite straightforward.")
 }

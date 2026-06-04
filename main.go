@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"go/ast"
-	"go/parser"
 	"go/token"
 	"log"
 	"math"
@@ -12,82 +11,81 @@ import (
 	"github.com/paulstuart/go-ast-wavelet/astwavelet"
 )
 
-const demoSource = "samples/simple/main.go"
+const sampleDir = "samples/simple"
 
 func main() {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, demoSource, nil, 0)
+	fset, files, index, err := astwavelet.LoadDir(sampleDir)
 	if err != nil {
-		log.Fatalf("parse error: %v", err)
+		log.Fatalf("load error: %v", err)
 	}
 
-	treeAnalysis(fset, file)
+	callGraphAnalysis(fset, index)
 	fmt.Println()
-	signalAnalysis(fset, file)
+	signalAnalysis(fset, files)
 }
 
-// treeAnalysis uses the tree-based Haar transform to rank nodes by
-// subtree energy (Approximation) and sibling heterogeneity (Detail).
-func treeAnalysis(fset *token.FileSet, file *ast.File) {
-	root := astwavelet.BuildWaveletTree(file)
+// callGraphAnalysis walks the call graph from main and applies the tree-based
+// wavelet transform to the resulting call hierarchy.
+func callGraphAnalysis(fset *token.FileSet, index astwavelet.FuncIndex) {
+	root := astwavelet.BuildCallGraph("main", index, fset)
+	if root == nil {
+		log.Fatal("no main function found in index")
+	}
 	root.Transform()
 
 	type entry struct {
 		name   string
-		ntype  string
 		line   int
 		approx float64
 		detail float64
+		depth  int
 	}
 
 	var rows []entry
-	var collect func(*astwavelet.WaveletNode)
-	collect = func(wn *astwavelet.WaveletNode) {
+	var collect func(*astwavelet.WaveletNode, int)
+	collect = func(wn *astwavelet.WaveletNode, depth int) {
 		if wn == nil {
 			return
 		}
-		if wn.Detail > 0.5 || wn.Approximation > 5.0 {
-			pos := fset.Position(wn.ASTNode.Pos())
-			rows = append(rows, entry{
-				name:   wn.Name,
-				ntype:  wn.Type,
-				line:   pos.Line,
-				approx: wn.Approximation,
-				detail: wn.Detail,
-			})
-		}
+		pos := fset.Position(wn.ASTNode.Pos())
+		rows = append(rows, entry{
+			name:   wn.Name,
+			line:   pos.Line,
+			approx: wn.Approximation,
+			detail: wn.Detail,
+			depth:  depth,
+		})
 		for _, child := range wn.Children {
-			collect(child)
+			collect(child, depth+1)
 		}
 	}
-	collect(root)
+	collect(root, 0)
 
 	sort.Slice(rows, func(i, j int) bool {
 		return rows[i].approx > rows[j].approx
 	})
 
-	fmt.Println("=== TREE ANALYSIS: Subtree Energy & Sibling Heterogeneity ===")
-	fmt.Printf("%-24s %-26s %5s  %10s  %10s\n", "Name", "AST Type", "Line", "Approx", "Detail")
-	fmt.Println(repeat("-", 80))
+	fmt.Println("=== CALL GRAPH ANALYSIS: Subtree Energy & Sibling Heterogeneity ===")
+	fmt.Printf("%-28s %5s  %10s  %10s  %s\n", "Function", "Line", "Approx", "Detail", "Depth")
+	fmt.Println(repeat("-", 70))
 	for _, r := range rows {
-		name := r.name
-		if name == "" {
-			name = "-"
-		}
-		fmt.Printf("%-24s %-26s %5d  %10.2f  %10.2f\n", name, r.ntype, r.line, r.approx, r.detail)
+		fmt.Printf("%-28s %5d  %10.2f  %10.2f  %d\n",
+			r.name, r.line, r.approx, r.detail, r.depth)
 	}
 }
 
 // signalAnalysis applies Ricker CWT and Haar DWT to a flat per-line signal
-// derived from AST node positions, then reports structural boundaries and
-// per-line irregularity.
-func signalAnalysis(fset *token.FileSet, file *ast.File) {
-	signal := astwavelet.BuildLineSignal(file, fset)
+// built from AST node positions across all files in the package.
+func signalAnalysis(fset *token.FileSet, files []*ast.File) {
+	// Merge per-line signals across all files into a single signal.
+	// Each file contributes a slice; we concatenate them.
+	var signal []float64
+	for _, f := range files {
+		signal = append(signal, astwavelet.BuildLineSignal(f, fset)...)
+	}
 
-	// Ricker CWT: structural boundary detection
 	cwt := astwavelet.ComputeCWT(signal, astwavelet.DefaultScales)
-	threshold := 0.3
-	peaks := astwavelet.DetectPeaks(cwt, threshold, 20, 2)
+	peaks := astwavelet.DetectPeaks(cwt, 0.3, 20, 2)
 
 	fmt.Println("=== SIGNAL ANALYSIS: Structural Boundaries (Ricker CWT) ===")
 	fmt.Printf("%-5s  %-8s  %-10s  %s\n", "Line", "Band", "Coeff", "Scale")
@@ -96,7 +94,6 @@ func signalAnalysis(fset *token.FileSet, file *ast.File) {
 		fmt.Printf("L%-4d  %-8s  %+.4f    %.0f\n", p.Line, p.Band, p.Coefficient, p.Scale)
 	}
 
-	// Haar DWT: per-line irregularity back-projection
 	maxLevels := min(int(math.Log2(float64(len(signal)))), 8)
 	decomp := astwavelet.HaarDecompose(signal, maxLevels)
 	irregularity := astwavelet.PerLineIrregularity(decomp, len(signal))
@@ -111,9 +108,7 @@ func signalAnalysis(fset *token.FileSet, file *ast.File) {
 			hot = append(hot, lineScore{i + 1, s})
 		}
 	}
-	sort.Slice(hot, func(i, j int) bool {
-		return hot[i].score > hot[j].score
-	})
+	sort.Slice(hot, func(i, j int) bool { return hot[i].score > hot[j].score })
 	if len(hot) > 15 {
 		hot = hot[:15]
 	}
