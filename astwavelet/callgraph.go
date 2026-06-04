@@ -1,25 +1,37 @@
 package astwavelet
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"golang.org/x/tools/go/packages"
 )
 
 // FuncIndex maps declaration keys to their AST nodes.
-// Plain functions are keyed by name ("main", "GnarlyFunction").
-// Methods are keyed by "TypeName.MethodName" ("Worker.Run").
+//
+// Indexing conventions:
+//   - Plain function in the entry package:  "FuncName"
+//   - Plain function in another package:    "pkgname.FuncName" (and "FuncName" as fallback)
+//   - Method (any package):                 "TypeName.MethodName"
+//
+// This lets the resolver handle all three call forms in Go:
+//   - localFunc()          → Ident → direct lookup by "FuncName"
+//   - pkg.Func()           → SelectorExpr → scan for suffix ".Func"
+//   - receiver.Method()    → SelectorExpr → scan for suffix ".Method"
 type FuncIndex map[string]*ast.FuncDecl
 
-// resolve returns the FuncDecl for a call expression, or nil if not in the index.
+// resolve returns all FuncDecls that could be the target of a call expression.
 //
-// For plain calls (Ident), looks up by name directly.
-// For method calls (SelectorExpr), tries "TypeName.Method" by scanning all
-// method-shaped keys whose suffix matches ".Method". This is the seam that
-// a full type-aware implementation would replace with a single O(1) lookup.
+// For Ident calls (local functions), returns the single exact match.
+// For SelectorExpr calls (pkg.Func or receiver.Method), returns all index
+// entries whose key ends in ".Sel" — intentionally over-approximating since
+// we have no type information. This is the seam a full type-aware
+// implementation would replace with a single O(1) lookup per call site.
 func (idx FuncIndex) resolve(expr ast.Expr) []*ast.FuncDecl {
 	switch v := expr.(type) {
 	case *ast.Ident:
@@ -27,10 +39,10 @@ func (idx FuncIndex) resolve(expr ast.Expr) []*ast.FuncDecl {
 			return []*ast.FuncDecl{fd}
 		}
 	case *ast.SelectorExpr:
-		method := "." + v.Sel.Name
+		suffix := "." + v.Sel.Name
 		var matches []*ast.FuncDecl
 		for key, fd := range idx {
-			if strings.HasSuffix(key, method) {
+			if strings.HasSuffix(key, suffix) {
 				matches = append(matches, fd)
 			}
 		}
@@ -39,25 +51,99 @@ func (idx FuncIndex) resolve(expr ast.Expr) []*ast.FuncDecl {
 	return nil
 }
 
-// BuildFuncIndex indexes all function and method declarations across a set of files.
-func BuildFuncIndex(files []*ast.File) FuncIndex {
+// LoadPackage loads the Go package at dir and all same-module packages it
+// transitively imports, returning a unified file set, AST files, and index.
+//
+// Same-module packages are identified by sharing the root module path.
+// Standard library and external dependencies are excluded — they have no
+// local ASTs we can walk anyway.
+func LoadPackage(dir string) (*token.FileSet, []*ast.File, FuncIndex, error) {
+	fset := token.NewFileSet()
+
+	cfg := &packages.Config{
+		Mode: packages.NeedName |
+			packages.NeedFiles |
+			packages.NeedSyntax |
+			packages.NeedImports |
+			packages.NeedDeps |
+			packages.NeedModule,
+		Fset: fset,
+		Dir:  dir,
+	}
+
+	pkgs, err := packages.Load(cfg, ".")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load %s: %w", dir, err)
+	}
+	if n := packages.PrintErrors(pkgs); n > 0 {
+		return nil, nil, nil, fmt.Errorf("%d package error(s)", n)
+	}
+
+	// Determine the module path so we can filter to same-module packages only.
+	var modulePath string
+	if len(pkgs) > 0 && pkgs[0].Module != nil {
+		modulePath = pkgs[0].Module.Path
+	}
+
+	seen := make(map[string]bool)
+	var allFiles []*ast.File
 	idx := make(FuncIndex)
-	for _, f := range files {
+
+	var walk func(pkg *packages.Package, isEntry bool)
+	walk = func(pkg *packages.Package, isEntry bool) {
+		if seen[pkg.ID] {
+			return
+		}
+		seen[pkg.ID] = true
+
+		// Skip stdlib and external deps; they have no local AST to walk.
+		if modulePath != "" {
+			if pkg.Module == nil || pkg.Module.Path != modulePath {
+				return
+			}
+		}
+
+		allFiles = append(allFiles, pkg.Syntax...)
+		addToIndex(idx, pkg, isEntry)
+
+		for _, imp := range pkg.Imports {
+			walk(imp, false)
+		}
+	}
+
+	for _, pkg := range pkgs {
+		walk(pkg, true)
+	}
+
+	return fset, allFiles, idx, nil
+}
+
+// addToIndex adds all function and method declarations from pkg to idx.
+func addToIndex(idx FuncIndex, pkg *packages.Package, isEntry bool) {
+	for _, f := range pkg.Syntax {
 		for _, decl := range f.Decls {
 			fd, ok := decl.(*ast.FuncDecl)
 			if !ok {
 				continue
 			}
-			key := fd.Name.Name
+
 			if fd.Recv != nil && len(fd.Recv.List) > 0 {
+				// Method: "TypeName.MethodName" (package-independent — calls
+				// always go through a receiver, so the selector is the method name)
 				if typeName := receiverType(fd.Recv.List[0].Type); typeName != "" {
-					key = typeName + "." + fd.Name.Name
+					idx[typeName+"."+fd.Name.Name] = fd
+				}
+			} else {
+				// Plain function: always index by bare name for local calls.
+				idx[fd.Name.Name] = fd
+				// Non-entry packages are called as pkg.Func() from outside,
+				// so also index as "pkgname.FuncName" for cross-package resolution.
+				if !isEntry {
+					idx[pkg.Name+"."+fd.Name.Name] = fd
 				}
 			}
-			idx[key] = fd
 		}
 	}
-	return idx
 }
 
 func receiverType(expr ast.Expr) string {
@@ -70,8 +156,8 @@ func receiverType(expr ast.Expr) string {
 	return ""
 }
 
-// LoadDir parses all .go files in dir and returns the file set, parsed files,
-// and a function index covering all declarations.
+// LoadDir parses all .go files in a single directory. Use LoadPackage for
+// programs that span multiple packages.
 func LoadDir(dir string) (*token.FileSet, []*ast.File, FuncIndex, error) {
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(dir)
@@ -94,6 +180,30 @@ func LoadDir(dir string) (*token.FileSet, []*ast.File, FuncIndex, error) {
 	return fset, files, BuildFuncIndex(files), nil
 }
 
+// BuildFuncIndex indexes all function and method declarations across a set of
+// files. All functions are keyed by bare name; methods by "TypeName.Method".
+// Use LoadPackage (and its addToIndex) for multi-package programs where
+// cross-package indexing is needed.
+func BuildFuncIndex(files []*ast.File) FuncIndex {
+	idx := make(FuncIndex)
+	for _, f := range files {
+		for _, decl := range f.Decls {
+			fd, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			key := fd.Name.Name
+			if fd.Recv != nil && len(fd.Recv.List) > 0 {
+				if typeName := receiverType(fd.Recv.List[0].Type); typeName != "" {
+					key = typeName + "." + fd.Name.Name
+				}
+			}
+			idx[key] = fd
+		}
+	}
+	return idx
+}
+
 // BuildCallGraph constructs a WaveletNode tree rooted at entryName, following
 // call edges through index. Each node represents a function; its children are
 // the distinct functions it calls that appear in the index.
@@ -113,8 +223,6 @@ func buildCallNode(name string, index FuncIndex, fset *token.FileSet, visited ma
 	}
 
 	if visited[name] {
-		// Represent the back-edge as a leaf so the parent still carries
-		// some complexity signal, but we don't recurse.
 		return &WaveletNode{
 			ASTNode:       fd,
 			Name:          name + " (↺)",
@@ -124,7 +232,7 @@ func buildCallNode(name string, index FuncIndex, fset *token.FileSet, visited ma
 	}
 
 	visited[name] = true
-	defer delete(visited, name) // allow re-entry from independent call paths
+	defer delete(visited, name)
 
 	wn := &WaveletNode{
 		ASTNode:       fd,
@@ -137,7 +245,6 @@ func buildCallNode(name string, index FuncIndex, fset *token.FileSet, visited ma
 		return wn
 	}
 
-	// Collect distinct callees within this function body.
 	seen := make(map[string]bool)
 	ast.Inspect(fd.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -161,8 +268,7 @@ func buildCallNode(name string, index FuncIndex, fset *token.FileSet, visited ma
 }
 
 // bodyComplexity sums BaselineComplexity across all AST nodes in a function's
-// body. This gives each call graph node a realistic initial complexity based on
-// the actual statements inside it, rather than the flat FuncDecl weight.
+// body, giving each call graph node a realistic initial score.
 func bodyComplexity(fd *ast.FuncDecl) float64 {
 	total := BaselineComplexity(fd)
 	if fd.Body == nil {
@@ -177,7 +283,7 @@ func bodyComplexity(fd *ast.FuncDecl) float64 {
 	return total
 }
 
-// funcDeclKey returns the index key for a FuncDecl by reverse-looking it up.
+// funcDeclKey reverse-looks up a FuncDecl's key in the index.
 func funcDeclKey(fd *ast.FuncDecl, index FuncIndex) string {
 	for key, v := range index {
 		if v == fd {

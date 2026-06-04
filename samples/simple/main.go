@@ -1,8 +1,13 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/paulstuart/go-ast-wavelet/samples/simple/util"
+)
 
 func main() {
+	util.Greet("world")
 	SimpleFunction()
 
 	items := []int{1, 42, 7}

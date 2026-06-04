@@ -14,7 +14,7 @@ import (
 const sampleDir = "samples/simple"
 
 func main() {
-	fset, files, index, err := astwavelet.LoadDir(sampleDir)
+	fset, files, index, err := astwavelet.LoadPackage(sampleDir)
 	if err != nil {
 		log.Fatalf("load error: %v", err)
 	}
