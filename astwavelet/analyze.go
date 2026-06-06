@@ -28,6 +28,11 @@ type Report struct {
 	// A line with high irregularity sits in a region that changes structural
 	// character at one or more scales — a natural focal point for review.
 	LineHotspots []LineHotspot
+
+	// SimilarFunctions are pairs of functions whose structural fingerprints
+	// are similar enough to warrant consideration for consolidation.
+	// Similarity is cosine similarity of their Haar detail coefficient vectors.
+	SimilarFunctions []SimilarPair
 }
 
 // CallNode is one function in the call graph.
@@ -69,6 +74,9 @@ func Analyze(dir, entryPoint string) (*Report, error) {
 
 	report.CallGraph = buildCallGraphReport(entryPoint, index, fset)
 	report.Boundaries, report.LineHotspots = buildSignalReport(files, fset)
+
+	fps := ComputeFingerprints(files, fset)
+	report.SimilarFunctions = FindSimilarFunctions(fps, 0.90)
 
 	return report, nil
 }

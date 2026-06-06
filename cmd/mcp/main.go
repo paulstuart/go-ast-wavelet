@@ -105,6 +105,30 @@ func main() {
 		handleStructuralBoundaries,
 	)
 
+	s.AddTool(
+		mcp.NewTool("find_similar_functions",
+			mcp.WithDescription(
+				"Identify pairs of functions that are structurally similar and may be candidates "+
+					"for consolidation into a single function. "+
+					"Similarity is measured by comparing per-function Haar wavelet fingerprints: "+
+					"each function's complexity signal is resampled to a fixed length, "+
+					"decomposed into multi-scale detail coefficients, and compared via cosine similarity. "+
+					"A score of 1.0 means identical structural rhythm; 0.9+ is a strong clone signal. "+
+					"Note: this detects *structural* similarity (same pattern of control flow and complexity), "+
+					"not semantic similarity. Two functions can be structurally identical but logically different. "+
+					"Use this as a starting point for manual review, not a definitive consolidation plan.",
+			),
+			mcp.WithString("dir",
+				mcp.Required(),
+				mcp.Description("Absolute or relative path to the Go package directory."),
+			),
+			mcp.WithNumber("threshold",
+				mcp.Description("Minimum cosine similarity to report (0.0–1.0). Defaults to 0.90. Lower values find looser matches."),
+			),
+		),
+		handleFindSimilarFunctions,
+	)
+
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("mcp server error: %v", err)
 	}
@@ -255,6 +279,52 @@ func handleStructuralBoundaries(_ context.Context, req mcp.CallToolRequest) (*mc
 			"medium": "Function/type boundaries (scales 4-16). Natural units for code review.",
 			"coarse": "Section boundaries (scales 32-128). Best split points for LLM context chunks.",
 		},
+	}
+	return jsonResult(out)
+}
+
+func handleFindSimilarFunctions(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	dir := req.GetString("dir", ".")
+	threshold := req.GetFloat("threshold", 0.90)
+
+	report, err := astwavelet.Analyze(filepath.Clean(dir), "main")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("analysis failed: %v", err)), nil
+	}
+
+	type outPair struct {
+		FunctionA  string  `json:"function_a"`
+		FunctionB  string  `json:"function_b"`
+		Similarity float64 `json:"similarity"`
+		Note       string  `json:"note"`
+	}
+
+	var pairs []outPair
+	for _, p := range report.SimilarFunctions {
+		if p.Similarity < threshold {
+			continue
+		}
+		note := "moderate structural similarity — review manually"
+		if p.Similarity >= 0.98 {
+			note = "near-identical structure — strong consolidation candidate"
+		} else if p.Similarity >= 0.95 {
+			note = "very similar structure — likely consolidation candidate"
+		} else if p.Similarity >= 0.90 {
+			note = "similar structural rhythm — worth comparing"
+		}
+		pairs = append(pairs, outPair{
+			FunctionA:  p.A,
+			FunctionB:  p.B,
+			Similarity: round2(p.Similarity),
+			Note:       note,
+		})
+	}
+
+	out := map[string]any{
+		"dir":       report.Dir,
+		"threshold": threshold,
+		"pairs":     pairs,
+		"caveat":    "Structural similarity measures control-flow pattern, not semantics. Always review before consolidating.",
 	}
 	return jsonResult(out)
 }
