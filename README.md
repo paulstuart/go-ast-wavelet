@@ -29,18 +29,18 @@ Go Source Files
        │
        ├─── Call Graph ─────────────────────────────────────────────────┐
        │    BuildCallGraph("main", index, fset)                         │
-       │         │                                                       │
+       │         │                                                      │
        │    Haar tree transform (bottom-up)                             │
        │    Approximation = subtree energy                              │
        │    Detail        = sibling heterogeneity                       │
-       │         │                                                       │
-       │    ┌────┴──────────────────────┐                              │
-       │    │ Fan-in · Cliffs · Exports │                              │
-       │    └───────────────────────────┘                              │
+       │         │                                                      │
+       │    ┌────┴──────────────────────┐                               │
+       │    │ Fan-in · Cliffs · Exports │                               │
+       │    └───────────────────────────┘                               │
        │                                                                │
-       │    Dead Code ──────────────── reachable via call edges        │
-       │    computeDeadCode()           referenced as values (FuncMap) │
-       │                                unreachable                    │
+       │    Dead Code ──────────────── reachable via call edges         │
+       │    computeDeadCode()           referenced as values (FuncMap)  │
+       │                                unreachable                     │
        │                                                                │
        └─── Per-Line Signal ────────────────────────────────────────────┘
             BuildLineSignal(file, fset)
